@@ -1,79 +1,129 @@
 import os
-import asyncio
 import logging
-import random
 from dotenv import load_dotenv
+from supabase import create_client, Client
+import random
 
-# Библиотеки для бота и ИИ
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.utils.chat_action import ChatActionSender
-from ollama import AsyncClient # Используем асинхронную версию
-
-# Загрузка переменных из .env
+# --- Загрузка ключей ---
 load_dotenv()
 
-TOKEN = os.getenv("BOT_TOKEN")
-OLLAMA_KEY = os.getenv("OLLAMA_API_KEY")
-
-# Инициализация объектов
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
-# Указываем хост и заголовки для Ollama Cloud
-client = AsyncClient(
-    host="https://ollama.com",
-    headers={'Authorization': f'Bearer {OLLAMA_KEY}'}
+supabase: Client = create_client(
+    os.getenv("SUPABASE_URL"),
+    os.getenv("SUPABASE_KEY")
 )
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-async def get_ai_response(context_messages):
-    """Функция для общения с Gemma 4"""
-    response_text = ""
-    async for part in await client.chat(
-        model='gemma4:31b-cloud', 
-        messages=context_messages, 
-        stream=True
-    ):
-        response_text += part['message']['content']
-    return response_text
 
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    await message.answer("... (бот медленно открывает глаза) ... Привет. Кажется, я тебя помню. Или нет?")
+# ──────────────────────────────────────────────
+#  ЛИЧНАЯ ПАМЯТЬ (приватные чаты)
+# ──────────────────────────────────────────────
 
-@dp.message(F.text)
-async def handle_message(message: types.Message):
-    # Имитация "чтения" и "обдумывания"
-    # На Render сервер уже проснулся, теперь делаем вид, что мы человек
-    read_delay = random.uniform(1.5, 4.0)
-    await asyncio.sleep(read_delay)
-    
-    # Включаем статус "печатает"
-    async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
-        # Формируем контекст (пока базовый, без БД)
-        # В будущем сюда добавим вызовы из Supabase (Общая, Личная, Мертвая базы)
-        context = [
-            {"role": "system", "content": "Ты живой человек со сложным характером. Ты слегка забывчива и эмоциональна."},
-            {"role": "user", "content": message.text}
-        ]
-        
-        # Получаем ответ от нейронки
-        reply = await get_ai_response(context)
-        
-        # Дополнительная задержка перед отправкой, имитирующая набор текста
-        typing_delay = len(reply) * 0.05 # 0.05 сек на каждый символ
-        await asyncio.sleep(min(typing_delay, 7.0)) # Но не более 7 секунд
-        
-        await message.answer(reply)
-
-async def main():
-    # Запуск бота
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
+async def get_personal_history(user_id: int) -> list:
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Бот ушел спать...")
+        response = supabase.table("personal_chats") \
+            .select("chat_history") \
+            .eq("user_id", user_id) \
+            .execute()
+        if response.data:
+            return response.data[0]["chat_history"]
+        return []
+    except Exception as e:
+        logger.error(f"get_personal_history error: {e}")
+        return []
+
+async def save_personal_message(user_id: int, username: str, role: str, content: str):
+    try:
+        history = await get_personal_history(user_id)
+        history.append({"role": role, "content": content})
+        history = history[-20:]  # Скользящее окно
+
+        supabase.table("personal_chats").upsert({
+            "user_id": user_id,
+            "username": username,
+            "chat_history": history,
+            "updated_at": "now()"
+        }).execute()
+    except Exception as e:
+        logger.error(f"save_personal_message error: {e}")
+
+
+# ──────────────────────────────────────────────
+#  ОБЩАЯ ПАМЯТЬ (групповые чаты)
+# ──────────────────────────────────────────────
+
+async def get_group_history(chat_id: int) -> list:
+    try:
+        response = supabase.table("group_chats") \
+            .select("chat_history") \
+            .eq("chat_id", chat_id) \
+            .execute()
+        if response.data:
+            return response.data[0]["chat_history"]
+        return []
+    except Exception as e:
+        logger.error(f"get_group_history error: {e}")
+        return []
+
+async def save_group_message(chat_id: int, chat_title: str, role: str, content: str):
+    try:
+        history = await get_group_history(chat_id)
+        history.append({"role": role, "content": content})
+        history = history[-30:]
+
+        supabase.table("group_chats").upsert({
+            "chat_id": chat_id,
+            "chat_title": chat_title,
+            "chat_history": history,
+            "updated_at": "now()"
+        }).execute()
+    except Exception as e:
+        logger.error(f"save_group_message error: {e}")
+
+
+# ──────────────────────────────────────────────
+#  МЁРТВАЯ ПАМЯТЬ (деградирующие воспоминания)
+# ──────────────────────────────────────────────
+
+def _decay_text(text: str, decay: float) -> str:
+    if decay >= 1.0:
+        return text
+    words = text.split()
+    result = []
+    for word in words:
+        if random.random() < decay:
+            result.append(word)
+        else:
+            result.append("...")
+    return " ".join(result)
+
+async def get_random_dead_memory() -> str:
+    try:
+        response = supabase.table("dead_memory") \
+            .select("id, content, decay") \
+            .execute()
+        if not response.data:
+            return "Я ничего не помню о своём прошлом..."
+
+        memory = random.choice(response.data)
+        decayed = _decay_text(memory["content"], memory["decay"])
+
+        new_decay = max(0.05, memory["decay"] - random.uniform(0.03, 0.08))
+        supabase.table("dead_memory").update({"decay": new_decay}) \
+            .eq("id", memory["id"]) \
+            .execute()
+
+        return decayed
+    except Exception as e:
+        logger.error(f"get_random_dead_memory error: {e}")
+        return "Что-то мелькнуло в памяти, но я не могу вспомнить..."
+
+async def add_dead_memory(content: str):
+    try:
+        supabase.table("dead_memory").insert({
+            "content": content,
+            "decay": 1.0
+        }).execute()
+    except Exception as e:
+        logger.error(f"add_dead_memory error: {e}")
