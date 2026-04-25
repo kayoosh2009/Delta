@@ -6,25 +6,15 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.chat_action import ChatActionSender
-from ollama import AsyncClient
 
-from memory import (
-    get_personal_history,
-    get_group_history,
-    get_random_dead_memory,
-    save_personal_message,
-    save_group_message,
-    add_dead_memory,
-)
 from ai import generate_personal_reply, generate_group_reply
-from diary import publish_diary_post, read_diary_comments, CHANNEL_CHAT_ID
+from diary import publish_diary_post, publish_diary_event, CHANNEL_CHAT_ID
 
 # ──────────────────────────────────────────────
 #  ИНИЦИАЛИЗАЦИЯ
 # ──────────────────────────────────────────────
 
 load_dotenv()
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -33,61 +23,148 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 # ──────────────────────────────────────────────
-#  ТАЙМИНГИ (имитация живого человека)
+#  ОЧЕРЕДЬ: бот не пишет двум сразу
 # ──────────────────────────────────────────────
 
-async def human_delay(text: str):
-    """
-    Двухфазная задержка:
-    1. Пауза 'заметила сообщение' (1-5 сек)
-    2. Пауза 'набирает текст' (зависит от длины ответа)
-    """
-    read_delay = random.uniform(1.5, 5.0)
-    await asyncio.sleep(read_delay)
+_active_chat: int | None = None  # ID чата который сейчас обрабатывается
+_active_lock = asyncio.Lock()
 
-    typing_delay = min(len(text) * 0.04, 8.0)
-    await asyncio.sleep(typing_delay)
+# ──────────────────────────────────────────────
+#  БУФЕР: ждём конца печатания пользователя
+# ──────────────────────────────────────────────
+
+# user_id -> последнее сообщение + таймер
+_user_buffers: dict[int, list[str]] = {}
+_user_timers: dict[int, asyncio.Task] = {}
+TYPING_WAIT = 4.0  # секунд ждём после последнего сообщения
+
+
+async def _send_reply_parts(chat_id: int, parts: list[str], reply_to: int | None = None):
+    """Отправляет список сообщений с паузами между ними"""
+    for i, part in enumerate(parts):
+        async with ChatActionSender.typing(bot=bot, chat_id=chat_id):
+            # Пауза имитирует набор текста
+            typing_delay = min(len(part) * 0.04, 6.0)
+            await asyncio.sleep(typing_delay)
+
+        if i == 0 and reply_to:
+            await bot.send_message(chat_id, part, reply_to_message_id=reply_to)
+        else:
+            await bot.send_message(chat_id, part)
+
+        # Пауза между сообщениями как у живого человека
+        if i < len(parts) - 1:
+            await asyncio.sleep(random.uniform(0.8, 2.5))
+
+
+async def _process_personal(
+    user_id: int,
+    username: str,
+    chat_id: int,
+    messages: list[str],
+    reply_to: int | None
+):
+    """Обрабатывает накопленные сообщения пользователя"""
+    global _active_chat
+
+    # Ждём пока бот освободится
+    async with _active_lock:
+        _active_chat = chat_id
+        try:
+            combined = " ".join(messages)
+            parts, should_post = await generate_personal_reply(user_id, username, combined)
+            await _send_reply_parts(chat_id, parts, reply_to)
+
+            if should_post:
+                logger.info(f"Interesting conversation with {username}, posting to diary...")
+                await publish_diary_event(bot, combined, " ".join(parts))
+        finally:
+            _active_chat = None
+
+
+async def _flush_user_buffer(
+    user_id: int,
+    username: str,
+    chat_id: int,
+    reply_to: int | None
+):
+    """Вызывается когда таймер истёк — пользователь перестал печатать"""
+    messages = _user_buffers.pop(user_id, [])
+    _user_timers.pop(user_id, None)
+
+    if not messages:
+        return
+
+    await _process_personal(user_id, username, chat_id, messages, reply_to)
 
 
 # ──────────────────────────────────────────────
-#  ХЭНДЛЕР: /start
+#  ХЭНДЛЕРЫ
 # ──────────────────────────────────────────────
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await asyncio.sleep(random.uniform(1.0, 3.0))
-    await message.answer(
-        random.choice([
-            "а, привет... не ожидала",
-            "о, ты написал. привет",
-            "привет) давно не общались",
-        ])
-    )
+    await message.answer(random.choice([
+        "а, привет... не ожидала",
+        "о, ты написал. привет",
+        "привет) давно не общались",
+    ]))
 
-
-# ──────────────────────────────────────────────
-#  ХЭНДЛЕР: текст в личке
-# ──────────────────────────────────────────────
 
 @dp.message(F.text & F.chat.type == "private")
 async def handle_personal_message(message: types.Message):
     user_id = message.from_user.id
     username = message.from_user.username or str(user_id)
+    chat_id = message.chat.id
 
-    async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
-        reply = await generate_personal_reply(user_id, username, message.text)
-        await human_delay(reply)
+    # Добавляем сообщение в буфер
+    if user_id not in _user_buffers:
+        _user_buffers[user_id] = []
+    _user_buffers[user_id].append(message.text)
 
-    await message.answer(reply)
+    # Сбрасываем таймер если уже был
+    if user_id in _user_timers:
+        _user_timers[user_id].cancel()
+
+    # Запускаем новый таймер
+    _user_timers[user_id] = asyncio.create_task(
+        _wait_and_flush(user_id, username, chat_id, message.message_id)
+    )
 
 
-# ──────────────────────────────────────────────
-#  ХЭНДЛЕР: текст в группе
-# ──────────────────────────────────────────────
+async def _wait_and_flush(user_id: int, username: str, chat_id: int, reply_to: int):
+    """Ждёт TYPING_WAIT секунд и запускает обработку"""
+    await asyncio.sleep(TYPING_WAIT)
+    await _flush_user_buffer(user_id, username, chat_id, reply_to)
+
+
+@dp.message(F.photo & F.chat.type == "private")
+async def handle_photo(message: types.Message):
+    user_id = message.from_user.id
+    username = message.from_user.username or str(user_id)
+    caption = message.caption or ""
+    fake_content = f"[прислал фото] {caption}".strip()
+
+    async with _active_lock:
+        parts, should_post = await generate_personal_reply(user_id, username, fake_content)
+        await _send_reply_parts(message.chat.id, parts, message.message_id)
+
+
+@dp.message(F.sticker & F.chat.type == "private")
+async def handle_sticker(message: types.Message):
+    user_id = message.from_user.id
+    username = message.from_user.username or str(user_id)
+    emoji = message.sticker.emoji or "стикер"
+    fake_content = f"[прислал стикер: {emoji}]"
+
+    async with _active_lock:
+        parts, _ = await generate_personal_reply(user_id, username, fake_content)
+        await _send_reply_parts(message.chat.id, parts, message.message_id)
+
 
 @dp.message(F.text & F.chat.type.in_({"group", "supergroup"}))
 async def handle_group_message(message: types.Message):
-    # В группе отвечаем только если упомянули бота или ответили на его сообщение
     bot_info = await bot.get_me()
     bot_username = f"@{bot_info.username}"
 
@@ -98,7 +175,6 @@ async def handle_group_message(message: types.Message):
     is_mentioned = bot_username.lower() in (message.text or "").lower()
 
     if not is_reply_to_bot and not is_mentioned:
-        # Иногда (5%) реагируем без упоминания — как живой человек
         if random.random() > 0.05:
             return
 
@@ -106,95 +182,38 @@ async def handle_group_message(message: types.Message):
     chat_title = message.chat.title or str(chat_id)
     username = message.from_user.username or message.from_user.first_name
 
-    async with ChatActionSender.typing(bot=bot, chat_id=chat_id):
-        reply = await generate_group_reply(chat_id, chat_title, username, message.text)
-        await human_delay(reply)
+    async with _active_lock:
+        parts, _ = await generate_group_reply(chat_id, chat_title, username, message.text)
+        await _send_reply_parts(chat_id, parts, message.message_id)
 
-    await message.answer(reply)
-
-
-# ──────────────────────────────────────────────
-#  ХЭНДЛЕР: фото в личке
-# ──────────────────────────────────────────────
-
-@dp.message(F.photo & F.chat.type == "private")
-async def handle_photo(message: types.Message):
-    user_id = message.from_user.id
-    username = message.from_user.username or str(user_id)
-
-    caption = message.caption or ""
-    fake_content = f"[пользователь прислал фото] {caption}".strip()
-
-    async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
-        reply = await generate_personal_reply(user_id, username, fake_content)
-        await human_delay(reply)
-
-    await message.answer(reply)
-
-
-# ──────────────────────────────────────────────
-#  ХЭНДЛЕР: стикер в личке
-# ──────────────────────────────────────────────
-
-@dp.message(F.sticker & F.chat.type == "private")
-async def handle_sticker(message: types.Message):
-    user_id = message.from_user.id
-    username = message.from_user.username or str(user_id)
-
-    emoji = message.sticker.emoji or "стикер"
-    fake_content = f"[пользователь прислал стикер: {emoji}]"
-
-    async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
-        reply = await generate_personal_reply(user_id, username, fake_content)
-        await human_delay(reply)
-
-    await message.answer(reply)
-
-
-# ──────────────────────────────────────────────
-#  ХЭНДЛЕР: комментарии в дневнике (ТГК)
-# ──────────────────────────────────────────────
 
 @dp.message(F.text & F.chat.id == CHANNEL_CHAT_ID)
 async def handle_diary_comment(message: types.Message):
-    """Бот читает комментарии в своём канале и иногда отвечает"""
-    if random.random() > 0.4:  # отвечает в 40% случаев
+    if random.random() > 0.4:
         return
-
-    username = message.from_user.username or message.from_user.first_name
     user_id = message.from_user.id
+    username = message.from_user.username or message.from_user.first_name
 
-    async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
-        reply = await generate_personal_reply(user_id, username, message.text)
-        await human_delay(reply)
-
-    await message.reply(reply)
+    async with _active_lock:
+        parts, _ = await generate_personal_reply(user_id, username, message.text)
+        await _send_reply_parts(message.chat.id, parts, message.message_id)
 
 
 # ──────────────────────────────────────────────
-#  ФОНОВАЯ ЗАДАЧА: дневник + "вспомнила написать"
+#  ФОНОВЫЕ ЗАДАЧИ
 # ──────────────────────────────────────────────
 
 async def background_tasks():
-    """
-    Запускается при старте сервера (cold start на Render).
-    Бот 'вспоминает' что хотела написать или публикует в дневник.
-    """
-    await asyncio.sleep(5)  # дать боту прогрузиться
+    await asyncio.sleep(5)
 
-    # С вероятностью 60% публикует пост в дневник при старте сервера
     if random.random() < 0.6:
         logger.info("Publishing diary post on startup...")
         await publish_diary_post(bot)
 
-    # Периодически пишем в дневник пока сервер живёт
     while True:
-        # Ждём от 30 до 90 минут
         wait_minutes = random.uniform(30, 90)
         await asyncio.sleep(wait_minutes * 60)
-
         if random.random() < 0.5:
-            logger.info("Scheduled diary post...")
             await publish_diary_post(bot)
 
 

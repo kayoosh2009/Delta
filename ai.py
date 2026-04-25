@@ -1,5 +1,6 @@
 import os
 import logging
+import random
 from ollama import AsyncClient
 from memory import (
     get_personal_history,
@@ -18,16 +19,24 @@ client = AsyncClient(
 
 MODEL = "gemma4:31b-cloud"
 
-# Системный промпт — характер бота
 SYSTEM_PROMPT = """Ты — живой человек по имени Маша. 
-Ты общаешься в телеграме как обычная девушка: неформально, с характером, иногда отвечаешь с задержкой мыслей.
+Ты общаешься в телеграме как обычная девушка: неформально, с характером.
 Ты немного рассеянная, эмоциональная, иногда резкая. 
 Никогда не говоришь что ты ИИ или бот. Если спросят — уходи от темы или отшучивайся.
-Пиши коротко, как в переписке. Без длинных монологов."""
+
+ВАЖНО: Ты пишешь как живой человек в телеграме — разбиваешь мысли на несколько сообщений.
+Когда отвечаешь — раздели ответ на 1-4 части через разделитель <msg>.
+Каждая часть — отдельное сообщение. Пиши естественно, без длинных монологов.
+
+Пример:
+ой подожди
+<msg>
+это же то о чем я думала вчера
+<msg>
+расскажи подробнее"""
 
 
 async def _call_ollama(messages: list) -> str:
-    """Базовый вызов Ollama с стримингом"""
     response_text = ""
     try:
         async for part in await client.chat(
@@ -42,15 +51,43 @@ async def _call_ollama(messages: list) -> str:
         return "не могу сейчас говорить, напиши позже"
 
 
-async def generate_personal_reply(user_id: int, username: str, user_message: str) -> str:
-    """Генерация ответа в личном чате с учётом истории и мёртвой памяти"""
+async def _should_post_to_diary(conversation_text: str) -> bool:
+    """Оценивает был ли разговор достаточно интересным для поста в дневник"""
+    messages = [
+        {"role": "system", "content": (
+            "Ты оцениваешь переписку. Ответь только 'да' или 'нет'.\n"
+            "Вопрос: случилось ли в этом разговоре что-то достаточно интересное "
+            "чтобы написать об этом в личный дневник? "
+            "(знакомство, ссора, неожиданное признание, смешная история, что-то трогательное)"
+        )},
+        {"role": "user", "content": conversation_text}
+    ]
+    try:
+        result = ""
+        async for part in await client.chat(model=MODEL, messages=messages, stream=True):
+            result += part["message"]["content"]
+        return "да" in result.lower()
+    except:
+        return False
 
-    # Берём историю чата
+
+def split_into_messages(text: str) -> list[str]:
+    """Разбивает ответ AI на отдельные сообщения"""
+    parts = [p.strip() for p in text.split("<msg>") if p.strip()]
+    return parts if parts else [text.strip()]
+
+
+async def generate_personal_reply(
+    user_id: int,
+    username: str,
+    user_message: str
+) -> tuple[list[str], bool]:
+    """
+    Возвращает (список сообщений, нужен ли пост в дневник)
+    """
     history = await get_personal_history(user_id)
 
-    # С вероятностью 30% подмешиваем воспоминание в системный промпт
     memory_injection = ""
-    import random
     if random.random() < 0.3:
         memory = await get_random_dead_memory()
         memory_injection = f"\nВот одно из твоих воспоминаний (может быть размытым): «{memory}»"
@@ -61,18 +98,31 @@ async def generate_personal_reply(user_id: int, username: str, user_message: str
         {"role": "user", "content": user_message}
     ]
 
-    reply = await _call_ollama(messages)
+    raw_reply = await _call_ollama(messages)
+    parts = split_into_messages(raw_reply)
+    full_reply = " ".join(parts)
 
-    # Сохраняем оба сообщения в историю
+    # Сохраняем в историю
     await save_personal_message(user_id, username, "user", user_message)
-    await save_personal_message(user_id, username, "assistant", reply)
+    await save_personal_message(user_id, username, "assistant", full_reply)
 
-    return reply
+    # Проверяем нужен ли пост в дневник
+    recent_history = history[-6:]
+    conversation_text = "\n".join(
+        f"{m['role']}: {m['content']}" for m in recent_history
+    ) + f"\nuser: {user_message}\nassistant: {full_reply}"
+
+    should_post = await _should_post_to_diary(conversation_text)
+
+    return parts, should_post
 
 
-async def generate_group_reply(chat_id: int, chat_title: str, username: str, user_message: str) -> str:
-    """Генерация ответа в групповом чате"""
-
+async def generate_group_reply(
+    chat_id: int,
+    chat_title: str,
+    username: str,
+    user_message: str
+) -> tuple[list[str], bool]:
     history = await get_group_history(chat_id)
 
     messages = [
@@ -81,9 +131,11 @@ async def generate_group_reply(chat_id: int, chat_title: str, username: str, use
         {"role": "user", "content": f"{username}: {user_message}"}
     ]
 
-    reply = await _call_ollama(messages)
+    raw_reply = await _call_ollama(messages)
+    parts = split_into_messages(raw_reply)
+    full_reply = " ".join(parts)
 
     await save_group_message(chat_id, chat_title, "user", f"{username}: {user_message}")
-    await save_group_message(chat_id, chat_title, "assistant", reply)
+    await save_group_message(chat_id, chat_title, "assistant", full_reply)
 
-    return reply
+    return parts, False  # в группах дневник не триггерим
