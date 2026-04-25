@@ -43,16 +43,18 @@ async def _send_reply_parts(chat_id: int, parts: list[str], reply_to: int | None
     """Отправляет список сообщений с паузами между ними"""
     for i, part in enumerate(parts):
         async with ChatActionSender.typing(bot=bot, chat_id=chat_id):
-            # Пауза имитирует набор текста
             typing_delay = min(len(part) * 0.04, 6.0)
             await asyncio.sleep(typing_delay)
 
-        if i == 0 and reply_to:
-            await bot.send_message(chat_id, part, reply_to_message_id=reply_to)
-        else:
+        try:
+            if i == 0 and reply_to:
+                await bot.send_message(chat_id, part, reply_to_message_id=reply_to)
+            else:
+                await bot.send_message(chat_id, part)
+        except Exception:
+            # Если reply не прошёл — отправляем без него
             await bot.send_message(chat_id, part)
 
-        # Пауза между сообщениями как у живого человека
         if i < len(parts) - 1:
             await asyncio.sleep(random.uniform(0.8, 2.5))
 
