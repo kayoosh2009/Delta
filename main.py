@@ -8,7 +8,7 @@ from aiogram.filters import Command
 from aiogram.utils.chat_action import ChatActionSender
 
 from ai import generate_personal_reply, generate_group_reply
-from diary import publish_diary_post, publish_diary_event, CHANNEL_CHAT_ID
+from diary import publish_diary_post, CHANNEL_CHAT_ID
 
 # ──────────────────────────────────────────────
 #  ИНИЦИАЛИЗАЦИЯ
