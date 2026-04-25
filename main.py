@@ -77,7 +77,7 @@ async def _process_personal(
 
             if should_post:
                 logger.info(f"Interesting conversation with {username}, posting to diary...")
-                await publish_diary_event(bot, combined, " ".join(parts))
+                await publish_diary_post(bot)
         finally:
             _active_chat = None
 
